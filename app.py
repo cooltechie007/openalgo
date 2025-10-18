@@ -16,6 +16,8 @@ from utils.logging import get_logger, log_startup_banner, highlight_url  # Impor
 from utils.socketio_error_handler import init_socketio_error_handling  # Import Socket.IO error handler
 # Import WebSocket proxy server - using relative import to avoid @ symbol issues
 from websocket_proxy.app_integration import start_websocket_proxy
+# Import auto-startup module - DISABLED
+# from utils.auto_startup import init_auto_startup
 
 from blueprints.auth import auth_bp
 from blueprints.dashboard import dashboard_bp
@@ -190,6 +192,9 @@ def create_app():
         
         # Initialize latency monitoring (after registering API blueprint)
         init_latency_monitoring(app)
+
+        # Initialize auto-startup (automatic login and broker authentication) - DISABLED
+        # init_auto_startup(app)
 
         # Auto-start Telegram bot if it was active
         try:

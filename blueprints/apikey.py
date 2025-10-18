@@ -14,6 +14,9 @@ api_key_bp = Blueprint('api_key_bp', __name__, url_prefix='/')
 ph = PasswordHasher()
 
 def generate_api_key():
+    api_key = os.getenv('OPENALGO_APIKEY')
+    if api_key:
+        return api_key
     """Generate a secure random API key"""
     # Generate 32 bytes of random data and encode as hex
     return secrets.token_hex(32)

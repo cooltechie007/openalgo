@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime, Time
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, DateTime, Time, Float
 from sqlalchemy.orm import scoped_session, sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
@@ -51,6 +51,7 @@ class Strategy(Base):
     
     # Relationships
     symbol_mappings = relationship("StrategySymbolMapping", back_populates="strategy", cascade="all, delete-orphan")
+    positions = relationship("StrategyPosition", back_populates="strategy", cascade="all, delete-orphan")
 
 class StrategySymbolMapping(Base):
     """Model for symbol mappings in strategies"""
@@ -60,13 +61,35 @@ class StrategySymbolMapping(Base):
     strategy_id = Column(Integer, ForeignKey('strategies.id'), nullable=False)
     symbol = Column(String(50), nullable=False)
     exchange = Column(String(10), nullable=False)
-    quantity = Column(Integer, nullable=False)
+    quantity = Column(Integer, nullable=False)  # Positive for BUY, Negative for SELL
     product_type = Column(String(10), nullable=False)  # MIS/CNC
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
     # Relationships
     strategy = relationship("Strategy", back_populates="symbol_mappings")
+
+class StrategyPosition(Base):
+    """Model for tracking strategy positions and PnL"""
+    __tablename__ = 'strategy_positions'
+    
+    id = Column(Integer, primary_key=True)
+    strategy_id = Column(Integer, ForeignKey('strategies.id'), nullable=False)
+    symbol = Column(String(50), nullable=False)
+    exchange = Column(String(10), nullable=False)
+    quantity = Column(Integer, nullable=False)  # Current position quantity
+    average_price = Column(Float, nullable=False)  # Average entry price
+    current_price = Column(Float, default=0.0)  # Current market price
+    unrealized_pnl = Column(Float, default=0.0)  # Unrealized PnL
+    realized_pnl = Column(Float, default=0.0)  # Realized PnL
+    entry_time = Column(DateTime(timezone=True), server_default=func.now())
+    exit_time = Column(DateTime(timezone=True))
+    is_active = Column(Boolean, default=True)  # Whether position is still active
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Relationships
+    strategy = relationship("Strategy", back_populates="positions")
 
 def init_db():
     """Initialize the database"""
@@ -203,7 +226,10 @@ def bulk_add_symbol_mappings(strategy_id, mappings):
         for mapping_data in mappings:
             mapping = StrategySymbolMapping(
                 strategy_id=strategy_id,
-                **mapping_data
+                symbol=mapping_data.get('symbol'),
+                exchange=mapping_data.get('exchange'),
+                quantity=mapping_data.get('quantity'),
+                product_type=mapping_data.get('product_type')
             )
             db_session.add(mapping)
         db_session.commit()
@@ -234,3 +260,92 @@ def delete_symbol_mapping(mapping_id):
         logger.error(f"Error deleting symbol mapping {mapping_id}: {str(e)}")
         db_session.rollback()
         return False
+
+def get_strategy_positions(strategy_id):
+    """Get all active positions for a strategy"""
+    try:
+        return StrategyPosition.query.filter_by(strategy_id=strategy_id, is_active=True).all()
+    except Exception as e:
+        logger.error(f"Error getting strategy positions: {str(e)}")
+        return []
+
+def has_active_positions(strategy_id):
+    """Check if strategy has any active positions"""
+    try:
+        return StrategyPosition.query.filter_by(strategy_id=strategy_id, is_active=True).count() > 0
+    except Exception as e:
+        logger.error(f"Error checking active positions: {str(e)}")
+        return False
+
+def create_strategy_position(strategy_id, symbol, exchange, quantity, average_price):
+    """Create a new strategy position"""
+    try:
+        position = StrategyPosition(
+            strategy_id=strategy_id,
+            symbol=symbol,
+            exchange=exchange,
+            quantity=quantity,
+            average_price=average_price,
+            current_price=average_price,
+            unrealized_pnl=0.0,
+            realized_pnl=0.0
+        )
+        db_session.add(position)
+        db_session.commit()
+        return position
+    except Exception as e:
+        logger.error(f"Error creating strategy position: {str(e)}")
+        db_session.rollback()
+        return None
+
+def update_strategy_position(position_id, quantity=None, current_price=None, unrealized_pnl=None):
+    """Update a strategy position"""
+    try:
+        position = StrategyPosition.query.get(position_id)
+        if position:
+            if quantity is not None:
+                position.quantity = quantity
+            if current_price is not None:
+                position.current_price = current_price
+            if unrealized_pnl is not None:
+                position.unrealized_pnl = unrealized_pnl
+            db_session.commit()
+            return position
+        return None
+    except Exception as e:
+        logger.error(f"Error updating strategy position: {str(e)}")
+        db_session.rollback()
+        return None
+
+def close_strategy_position(position_id, realized_pnl=None):
+    """Close a strategy position"""
+    try:
+        position = StrategyPosition.query.get(position_id)
+        if position:
+            position.is_active = False
+            position.exit_time = func.now()
+            if realized_pnl is not None:
+                position.realized_pnl = realized_pnl
+            db_session.commit()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error closing strategy position: {str(e)}")
+        db_session.rollback()
+        return False
+
+def get_strategy_pnl(strategy_id):
+    """Get total PnL for a strategy"""
+    try:
+        positions = StrategyPosition.query.filter_by(strategy_id=strategy_id).all()
+        total_unrealized = sum(pos.unrealized_pnl for pos in positions if pos.is_active)
+        total_realized = sum(pos.realized_pnl for pos in positions)
+        return {
+            'unrealized_pnl': total_unrealized,
+            'realized_pnl': total_realized,
+            'total_pnl': total_unrealized + total_realized,
+            'active_positions': len([pos for pos in positions if pos.is_active])
+        }
+    except Exception as e:
+        logger.error(f"Error getting strategy PnL: {str(e)}")
+        return {'unrealized_pnl': 0, 'realized_pnl': 0, 'total_pnl': 0, 'active_positions': 0}

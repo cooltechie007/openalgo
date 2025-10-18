@@ -1,12 +1,10 @@
 from flask import Blueprint, render_template, request, jsonify, session, flash, redirect, url_for, abort
 from database.strategy_db import (
-    Strategy, StrategySymbolMapping, StrategyPosition, db_session,
+    Strategy, StrategySymbolMapping, db_session,
     create_strategy, add_symbol_mapping, get_strategy_by_webhook_id,
     get_symbol_mappings, get_all_strategies, delete_strategy,
     update_strategy_times, delete_symbol_mapping, bulk_add_symbol_mappings,
-    toggle_strategy, get_strategy, get_user_strategies,
-    get_strategy_positions, has_active_positions, create_strategy_position,
-    update_strategy_position, close_strategy_position, get_strategy_pnl
+    toggle_strategy, get_strategy, get_user_strategies
 )
 from database.symbol import enhanced_search_symbols
 from database.auth_db import get_api_key_for_tradingview
@@ -249,37 +247,25 @@ def squareoff_positions(strategy_id):
         # Get all symbol mappings
         mappings = get_symbol_mappings(strategy_id)
         
-        # Sort mappings to process BUY orders first, then SELL orders for squareoff
-        def get_squareoff_priority(mapping):
-            # For squareoff, prioritize SELL orders (to close long positions first)
-            return 0 if mapping.quantity > 0 else 1
-        
-        sorted_mappings = sorted(mappings, key=get_squareoff_priority)
-        
-        for mapping in sorted_mappings:
-            # For squareoff, reverse the quantity sign to close the position
-            squareoff_action = 'SELL' if mapping.quantity > 0 else 'BUY'
-            
+        for mapping in mappings:
+            # Use placesmartorder with quantity=0 and position_size=0 for squareoff
             payload = {
                 'apikey': api_key,
+                'symbol': mapping.symbol,
                 'exchange': mapping.exchange,
                 'product': mapping.product_type,
                 'strategy': strategy.name,
-                'action': squareoff_action
+                'action': 'SELL',  # Direction doesn't matter for closing
+                'pricetype': 'MARKET',
+                'quantity': '0',
+                'position_size': '0',  # This will close the position
+                'price': '0',
+                'trigger_price': '0',
+                'disclosed_quantity': '0'
             }
             
             # Queue the order instead of executing directly
-            queue_order('placeorder', payload)
-            
-            # Close the corresponding strategy position
-            # Find the position for this symbol and close it
-            positions = get_strategy_positions(strategy_id)
-            for position in positions:
-                if position.symbol == mapping.symbol and position.exchange == mapping.exchange:
-                    # Calculate realized PnL (simplified - should use actual exit price)
-                    realized_pnl = 0.0  # This should be calculated based on actual exit price
-                    close_strategy_position(position.id, realized_pnl)
-                    logger.info(f'Closed strategy position for {mapping.symbol}')
+            queue_order('placesmartorder', payload)
             
     except Exception as e:
         logger.error(f'Error in squareoff_positions for strategy {strategy_id}: {str(e)}')
@@ -401,14 +387,10 @@ def view_strategy(strategy_id):
         return redirect(url_for('strategy_bp.index'))
     
     symbol_mappings = get_symbol_mappings(strategy_id)
-    positions = get_strategy_positions(strategy_id)
-    pnl_data = get_strategy_pnl(strategy_id)
     
     return render_template('strategy/view_strategy.html', 
                          strategy=strategy,
-                         symbol_mappings=symbol_mappings,
-                         positions=positions,
-                         pnl_data=pnl_data)
+                         symbol_mappings=symbol_mappings)
 
 @strategy_bp.route('/toggle/<int:strategy_id>', methods=['POST'])
 def toggle_strategy_route(strategy_id):
@@ -510,24 +492,16 @@ def configure_symbols(strategy_id):
                     
                     parts = line.strip().split(',')
                     if len(parts) != 4:
-                        raise ValueError(f'Invalid format in line: {line}. Expected: symbol,exchange,quantity,product')
+                        raise ValueError(f'Invalid format in line: {line}')
                     
                     symbol, exchange, quantity, product = parts
                     if exchange not in VALID_EXCHANGES:
                         raise ValueError(f'Invalid exchange: {exchange}')
                     
-                    try:
-                        quantity = int(quantity)
-                    except ValueError:
-                        raise ValueError(f'Invalid quantity: {quantity}. Must be a number')
-                    
-                    if quantity == 0:
-                        raise ValueError(f'Quantity cannot be zero for symbol: {symbol}')
-                    
                     mappings.append({
                         'symbol': symbol.strip(),
                         'exchange': exchange.strip(),
-                        'quantity': quantity,
+                        'quantity': int(quantity),
                         'product_type': product.strip()
                     })
                 
@@ -560,8 +534,8 @@ def configure_symbols(strategy_id):
                 except ValueError:
                     raise ValueError('Quantity must be a valid number')
                 
-                if quantity == 0:
-                    raise ValueError('Quantity cannot be zero')
+                if quantity <= 0:
+                    raise ValueError('Quantity must be greater than 0')
                 
                 mapping = add_symbol_mapping(
                     strategy_id=strategy_id,
@@ -628,74 +602,10 @@ def search_symbols():
         } for result in results]
     })
 
-@strategy_bp.route('/<int:strategy_id>/pnl')
-@check_session_validity
-def get_strategy_pnl_api(strategy_id):
-    """Get strategy PnL data via API"""
-    user_id = session.get('user')
-    if not user_id:
-        return jsonify({'error': 'Session expired'}), 401
-        
-    strategy = get_strategy(strategy_id)
-    if not strategy or strategy.user_id != user_id:
-        return jsonify({'error': 'Strategy not found'}), 404
-    
-    try:
-        positions = get_strategy_positions(strategy_id)
-        pnl_data = get_strategy_pnl(strategy_id)
-        
-        return jsonify({
-            'strategy_id': strategy_id,
-            'strategy_name': strategy.name,
-            'pnl_data': pnl_data,
-            'positions': [{
-                'id': pos.id,
-                'symbol': pos.symbol,
-                'exchange': pos.exchange,
-                'quantity': pos.quantity,
-                'average_price': pos.average_price,
-                'current_price': pos.current_price,
-                'unrealized_pnl': pos.unrealized_pnl,
-                'realized_pnl': pos.realized_pnl,
-                'entry_time': pos.entry_time.isoformat() if pos.entry_time else None,
-                'is_active': pos.is_active
-            } for pos in positions]
-        })
-    except Exception as e:
-        logger.error(f'Error getting strategy PnL: {str(e)}')
-        return jsonify({'error': 'Internal server error'}), 500
-
 @strategy_bp.route('/webhook/<webhook_id>', methods=['POST'])
 @limiter.limit(WEBHOOK_RATE_LIMIT)
 def webhook(webhook_id):
-    """
-    Handle webhook from trading platform
-    
-    When a webhook is called with a symbol, it executes ALL orders configured in the strategy.
-    Each symbol mapping uses quantity sign: positive for BUY, negative for SELL.
-    
-    Order Execution Priority:
-    - BUY webhook: BUY orders executed first, then SELL orders
-    - SELL webhook: SELL orders executed first, then BUY orders
-    
-    Example webhook payload:
-    {
-        "symbol": "NIFTY04NOV2525000CE",
-        "action": "BUY"
-    }
-    
-    Strategy configuration:
-    - NIFTY04NOV2525000CE: quantity = +50 (BUY)
-    - NIFTY04NOV2525200CE: quantity = -50 (SELL)
-    
-    Execution order for BUY webhook:
-    1. BUY NIFTY04NOV2525000CE (50 qty) - executed first
-    2. SELL NIFTY04NOV2525200CE (50 qty) - executed second
-    
-    For exit orders, the quantities are reversed:
-    1. SELL NIFTY04NOV2525000CE (50 qty) - executed first
-    2. BUY NIFTY04NOV2525200CE (50 qty) - executed second
-    """
+    """Handle webhook from trading platform"""
     try:
         strategy = get_strategy_by_webhook_id(webhook_id)
         if not strategy:
@@ -704,6 +614,43 @@ def webhook(webhook_id):
         if not strategy.is_active:
             return jsonify({'error': 'Strategy is inactive'}), 400
         
+        # Check trading hours for intraday strategies
+        if strategy.is_intraday:
+            now = datetime.now(pytz.timezone('Asia/Kolkata'))
+            current_time = now.strftime('%H:%M')
+            
+            # Determine if this is an entry or exit order
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'No data received'}), 400
+            
+            action = data['action'].upper()
+            position_size = int(data.get('position_size', 0))
+            
+            is_exit_order = False
+            if strategy.trading_mode == 'LONG':
+                is_exit_order = action == 'SELL'
+            elif strategy.trading_mode == 'SHORT':
+                is_exit_order = action == 'BUY'
+            else:  # BOTH mode
+                is_exit_order = position_size == 0
+            
+            # For entry orders, check if within entry time window
+            if not is_exit_order:
+                if strategy.start_time and current_time < strategy.start_time:
+                    return jsonify({'error': 'Entry orders not allowed before start time'}), 400
+                
+                if strategy.end_time and current_time > strategy.end_time:
+                    return jsonify({'error': 'Entry orders not allowed after end time'}), 400
+            
+            # For exit orders, check if within exit time window (up to square off time)
+            else:
+                if strategy.start_time and current_time < strategy.start_time:
+                    return jsonify({'error': 'Exit orders not allowed before start time'}), 400
+                
+                if strategy.squareoff_time and current_time > strategy.squareoff_time:
+                    return jsonify({'error': 'Exit orders not allowed after square off time'}), 400
+        
         # Parse webhook data
         data = request.get_json()
         if not data:
@@ -711,130 +658,97 @@ def webhook(webhook_id):
         
         # Validate required fields
         required_fields = ['symbol', 'action']
+        if strategy.trading_mode == 'BOTH':
+            required_fields.append('position_size')
+            
         missing_fields = [field for field in required_fields if field not in data]
         if missing_fields:
             return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
-        
-        webhook_symbol = data['symbol']
-        webhook_action = data['action'].upper()
-        
-        # Validate action
-        if webhook_action not in ['BUY', 'SELL']:
-            return jsonify({'error': 'Invalid action. Use BUY or SELL'}), 400
-        
-        # Check trading hours for intraday strategies
-        if strategy.is_intraday:
-            now = datetime.now(pytz.timezone('Asia/Kolkata'))
-            current_time = now.strftime('%H:%M')
             
-            # For entry orders, check if within entry time window
-            if strategy.start_time and current_time < strategy.start_time:
-                return jsonify({'error': 'Orders not allowed before start time'}), 400
+        # Validate action based on trading mode
+        action = data['action'].upper()
+        position_size = int(data.get('position_size', 0))
+        
+        if strategy.trading_mode == 'LONG':
+            if action not in ['BUY', 'SELL']:
+                return jsonify({'error': 'Invalid action for LONG mode. Use BUY to enter, SELL to exit'}), 400
+            use_smart_order = action == 'SELL'
+        elif strategy.trading_mode == 'SHORT':
+            if action not in ['BUY', 'SELL']:
+                return jsonify({'error': 'Invalid action for SHORT mode. Use SELL to enter, BUY to exit'}), 400
+            use_smart_order = action == 'BUY'
+        else:  # BOTH mode
+            if action not in ['BUY', 'SELL']:
+                return jsonify({'error': 'Invalid action. Use BUY or SELL'}), 400
             
-            if strategy.end_time and current_time > strategy.end_time:
-                return jsonify({'error': 'Orders not allowed after end time'}), 400
+            # Validate position size based on action
+            if action == 'BUY' and position_size < 0:
+                return jsonify({'error': 'For BUY orders in BOTH mode, position_size must be >= 0'}), 400
+            if action == 'SELL' and position_size > 0:
+                return jsonify({'error': 'For SELL orders in BOTH mode, position_size must be <= 0'}), 400
             
-            if strategy.squareoff_time and current_time > strategy.squareoff_time:
-                return jsonify({'error': 'Orders not allowed after square off time'}), 400
-        
-        # Get all symbol mappings for this strategy
-        mappings = get_symbol_mappings(strategy.id)
-        if not mappings:
-            return jsonify({'error': 'No symbol mappings found for this strategy'}), 400
-        
-        # Check if strategy already has active positions (prevent duplicate entries)
-        if has_active_positions(strategy.id):
-            return jsonify({
-                'error': 'Strategy already has active positions. Close existing positions before entering new trades.',
-                'message': 'Use SELL webhook to exit existing positions first'
-            }), 400
-        
+            # Smart order logic:
+            # - BUY with position_size=0 means exit SHORT position
+            # - SELL with position_size=0 means exit LONG position
+            use_smart_order = position_size == 0
+            
+        # Get symbol mapping
+        mapping = next((m for m in get_symbol_mappings(strategy.id) if m.symbol == data['symbol']), None)
+        if not mapping:
+            return jsonify({'error': f'No mapping found for symbol {data["symbol"]}'}), 400
+            
         # Get API key from database
         api_key = get_api_key_for_tradingview(strategy.user_id)
         if not api_key:
             logger.error(f'No API key found for user {strategy.user_id}')
             return jsonify({'error': 'No API key found'}), 401
-        
-        # Process all strategy orders - BUY orders first, then SELL orders
-        processed_orders = []
-        failed_orders = []
-        
-        # Sort mappings to process BUY orders first, then SELL orders
-        def get_order_priority(mapping):
-            if webhook_action == 'BUY':
-                # For BUY webhook, prioritize BUY orders (positive quantities)
-                return 0 if mapping.quantity > 0 else 1
-            else:  # webhook_action == 'SELL'
-                # For SELL webhook, prioritize SELL orders (negative quantities)
-                return 0 if mapping.quantity < 0 else 1
-        
-        sorted_mappings = sorted(mappings, key=get_order_priority)
-        
-        for mapping in sorted_mappings:
-            try:
-                # Determine the action based on quantity sign and webhook action
-                if webhook_action == 'BUY':
-                    # For BUY webhook, use the mapping quantity as-is
-                    order_action = 'BUY' if mapping.quantity > 0 else 'SELL'
-                    order_quantity = abs(mapping.quantity)
-                else:  # webhook_action == 'SELL'
-                    # For SELL webhook, reverse the quantity sign for exit
-                    order_action = 'SELL' if mapping.quantity > 0 else 'BUY'
-                    order_quantity = abs(mapping.quantity)
-                
-                # Prepare order payload (only action field)
-                payload = {
-                        'apikey': api_key,
-                        'symbol': mapping.symbol,
-                        'exchange': mapping.exchange,
-                        'product': mapping.product_type,
-                        'strategy': strategy.name,
-                        'action': order_action,
-                        'quantity': order_quantity,
-                        'pricetype': 'MARKET'
-                    }
-                
-                # Queue the order
-                queue_order('placeorder', payload)
-                processed_orders.append({
-                    'symbol': mapping.symbol,
-                    'action': order_action,
-                    'quantity': order_quantity
-                })
-                logger.info(f'Strategy order queued: {order_action} {mapping.symbol} qty={order_quantity}')
-                
-                # Create strategy position record for tracking PnL
-                # Note: This is a simplified approach - in production, you'd want to get actual fill prices
-                # For now, we'll use a placeholder price that should be updated from order fills
-                placeholder_price = 100.0  # This should be replaced with actual fill price
-                create_strategy_position(
-                    strategy_id=strategy.id,
-                    symbol=mapping.symbol,
-                    exchange=mapping.exchange,
-                    quantity=order_quantity,
-                    average_price=placeholder_price
-                )
-                
-            except Exception as e:
-                failed_orders.append({
-                    'symbol': mapping.symbol,
-                    'error': str(e)
-                })
-                logger.error(f'Error processing order for {mapping.symbol}: {str(e)}')
-        
-        # Return response with processing results
-        response_data = {
-            'message': f'Strategy execution completed for webhook symbol {webhook_symbol}',
-            'webhook_action': webhook_action,
-            'processed_orders': processed_orders,
-            'total_processed': len(processed_orders)
+
+        # Prepare order payload
+        payload = {
+            'apikey': api_key,
+            'symbol': mapping.symbol,
+            'exchange': mapping.exchange,
+            'product': mapping.product_type,
+            'strategy': strategy.name,
+            'action': action,
+            'pricetype': 'MARKET'
         }
         
-        if failed_orders:
-            response_data['failed_orders'] = failed_orders
-            response_data['total_failed'] = len(failed_orders)
-        
-        return jsonify(response_data), 200
+        # Set quantity based on order type
+        if strategy.trading_mode == 'BOTH':
+            # For BOTH mode, always use placesmartorder with direct position size
+            # Set quantity to 0 if position_size is 0 (for exits)
+            quantity = '0' if position_size == 0 else str(mapping.quantity)
+            payload.update({
+                'quantity': quantity,
+                'position_size': str(position_size),  # Use position_size directly from webhook data
+                'price': '0',
+                'trigger_price': '0',
+                'disclosed_quantity': '0'
+            })
+            endpoint = 'placesmartorder'
+        else:
+            # For LONG/SHORT modes, keep existing logic
+            if use_smart_order:
+                payload.update({
+                    'quantity': '0',
+                    'position_size': '0',  # This will close the position
+                    'price': '0',
+                    'trigger_price': '0',
+                    'disclosed_quantity': '0'
+                })
+                endpoint = 'placesmartorder'
+            else:
+                # For regular orders, use absolute value of position_size if provided, otherwise use mapping quantity
+                quantity = abs(position_size) if position_size != 0 else mapping.quantity
+                payload.update({
+                    'quantity': str(quantity)
+                })
+                endpoint = 'placeorder'
+            
+        # Queue the order
+        queue_order(endpoint, payload)
+        return jsonify({'message': f'Order queued successfully for {data["symbol"]}'}), 200
             
     except Exception as e:
         logger.error(f'Error processing webhook: {str(e)}')

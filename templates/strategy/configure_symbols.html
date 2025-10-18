@@ -74,7 +74,10 @@
                             <span class="label-text-alt text-error">*</span>
                         </label>
                         <input type="number" name="quantity" class="input input-bordered w-full"
-                               min="1" step="1" required>
+                               step="1" required>
+                        <label class="label">
+                            <span class="label-text-alt">Positive for BUY orders, Negative for SELL orders</span>
+                        </label>
                     </div>
 
                     <div class="form-control w-full">
@@ -108,7 +111,7 @@
                             <span class="label-text-alt text-error">*</span>
                         </label>
                         <textarea name="symbols" class="textarea textarea-bordered w-full h-48" required
-                                  placeholder="Format: Symbol,Exchange,Quantity,Product&#10;Example:&#10;SBIN,NSE,100,MIS&#10;INFY,NSE,50,CNC"></textarea>
+                                  placeholder="Format: Symbol,Exchange,Quantity,Product&#10;Example:&#10;SBIN,NSE,100,MIS&#10;INFY,NSE,-50,CNC&#10;Note: Positive quantity = BUY, Negative quantity = SELL"></textarea>
                     </div>
 
                     <div class="alert alert-info">
@@ -120,7 +123,8 @@
                                 <li>Exchange: NSE, BSE, NFO, CDS, BFO, BCD, MCX, or NCDEX</li>
                                 <li>Product: MIS (Intraday), CNC (Delivery), or NRML (Normal)</li>
                                 <li>Note: CNC is only available for NSE/BSE, NRML for derivatives</li>
-                                <li>Quantity: Whole numbers only</li>
+                                <li>Quantity: Positive for BUY orders, Negative for SELL orders</li>
+                                <li>Examples: +100 (BUY 100), -50 (SELL 50)</li>
                             </ul>
                         </div>
                     </div>
