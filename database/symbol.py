@@ -81,18 +81,18 @@ def enhanced_search_symbols(query: str, exchange: str = None) -> List[SymToken]:
             try:
                 num_term = float(term)
                 term_conditions = or_(
-                    SymToken.symbol.ilike(f'%{term}%'),
-                    SymToken.brsymbol.ilike(f'%{term}%'),
-                    SymToken.name.ilike(f'%{term}%'),
-                    SymToken.token.ilike(f'%{term}%'),
+                    SymToken.symbol.ilike(f'{term}%'),
+                    SymToken.brsymbol.ilike(f'{term}%'),
+                    SymToken.name.ilike(f'{term}%'),
+                    SymToken.token.ilike(f'{term}%'),
                     SymToken.strike == num_term
                 )
             except ValueError:
                 term_conditions = or_(
-                    SymToken.symbol.ilike(f'%{term}%'),
-                    SymToken.brsymbol.ilike(f'%{term}%'),
-                    SymToken.name.ilike(f'%{term}%'),
-                    SymToken.token.ilike(f'%{term}%')
+                    SymToken.symbol.ilike(f'{term}%'),
+                    SymToken.brsymbol.ilike(f'{term}%'),
+                    SymToken.name.ilike(f'{term}%'),
+                    SymToken.token.ilike(f'{term}%')
                 )
             all_conditions.append(term_conditions)
         

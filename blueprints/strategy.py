@@ -190,8 +190,38 @@ def validate_strategy_times(start_time, end_time, squareoff_time):
     except ValueError:
         return False, "Invalid time format. Use HH:MM format"
 
+def validate_position_logic(strategy_id, webhook_action):
+    """
+    Enhanced position validation logic
+    
+    Returns:
+        tuple: (is_valid, error_message, active_positions_info)
+    """
+    try:
+        active_positions = get_strategy_positions(strategy_id)
+        has_active_positions = any(pos.is_active for pos in active_positions)
+        
+        if has_active_positions and webhook_action == 'ENTRY':
+            return False, 'Strategy already has active positions. Cannot enter new trades.', [
+                {
+                    'symbol': pos.symbol,
+                    'exchange': pos.exchange,
+                    'quantity': pos.quantity,
+                    'average_price': pos.average_price,
+                    'unrealized_pnl': pos.unrealized_pnl
+                } for pos in active_positions if pos.is_active
+            ]
+        
+        if not has_active_positions and webhook_action == 'EXIT':
+            return False, 'No active positions found. Cannot exit without entry.', []
+        
+        return True, None, []
+        
+    except Exception as e:
+        logger.error(f'Error validating position logic: {str(e)}')
+        return False, f'Error validating positions: {str(e)}', []
+
 def validate_strategy_name(name):
-    """Validate strategy name format"""
     if not name:
         return False, "Strategy name is required"
     
@@ -669,32 +699,40 @@ def get_strategy_pnl_api(strategy_id):
 @limiter.limit(WEBHOOK_RATE_LIMIT)
 def webhook(webhook_id):
     """
-    Handle webhook from trading platform
+    Handle webhook from trading platform with enhanced position logic
+    
+    ENHANCED POSITION LOGIC:
+    - ENTRY webhook: Entry orders (as configured in strategy) - only allowed if NO active positions exist
+    - EXIT webhook: Reverse orders (closes positions) - only allowed if active positions exist
     
     When a webhook is called with a symbol, it executes ALL orders configured in the strategy.
     Each symbol mapping uses quantity sign: positive for BUY, negative for SELL.
     
     Order Execution Priority:
-    - BUY webhook: BUY orders executed first, then SELL orders
-    - SELL webhook: SELL orders executed first, then BUY orders
+    - ENTRY webhook: Executes orders as configured (entry)
+    - EXIT webhook: Reverses all orders (exit by doing opposite)
     
-    Example webhook payload:
+    Example webhook payloads:
     {
         "symbol": "NIFTY04NOV2525000CE",
-        "action": "BUY"
+        "action": "ENTRY"   // Entry - executes as configured
+    }
+    {
+        "symbol": "NIFTY04NOV2525000CE",
+        "action": "EXIT"    // Exit - reverses all orders
     }
     
     Strategy configuration:
     - NIFTY04NOV2525000CE: quantity = +50 (BUY)
     - NIFTY04NOV2525200CE: quantity = -50 (SELL)
     
-    Execution order for BUY webhook:
+    Execution for ENTRY webhook:
     1. BUY NIFTY04NOV2525000CE (50 qty) - executed first
     2. SELL NIFTY04NOV2525200CE (50 qty) - executed second
     
-    For exit orders, the quantities are reversed:
-    1. SELL NIFTY04NOV2525000CE (50 qty) - executed first
-    2. BUY NIFTY04NOV2525200CE (50 qty) - executed second
+    Execution for EXIT webhook (reverse):
+    1. SELL NIFTY04NOV2525000CE (50 qty) - reverse of BUY
+    2. BUY NIFTY04NOV2525200CE (50 qty) - reverse of SELL
     """
     try:
         strategy = get_strategy_by_webhook_id(webhook_id)
@@ -719,8 +757,8 @@ def webhook(webhook_id):
         webhook_action = data['action'].upper()
         
         # Validate action
-        if webhook_action not in ['BUY', 'SELL']:
-            return jsonify({'error': 'Invalid action. Use BUY or SELL'}), 400
+        if webhook_action not in ['ENTRY', 'EXIT']:
+            return jsonify({'error': 'Invalid action. Use ENTRY or EXIT'}), 400
         
         # Check trading hours for intraday strategies
         if strategy.is_intraday:
@@ -742,12 +780,20 @@ def webhook(webhook_id):
         if not mappings:
             return jsonify({'error': 'No symbol mappings found for this strategy'}), 400
         
-        # Check if strategy already has active positions (prevent duplicate entries)
-        if has_active_positions(strategy.id):
-            return jsonify({
-                'error': 'Strategy already has active positions. Close existing positions before entering new trades.',
-                'message': 'Use SELL webhook to exit existing positions first'
-            }), 400
+        # Enhanced position logic validation
+        is_valid, error_message, active_positions_info = validate_position_logic(strategy.id, webhook_action)
+        if not is_valid:
+            response_data = {
+                'error': error_message,
+                'webhook_action': webhook_action
+            }
+            if active_positions_info:
+                response_data['active_positions'] = active_positions_info
+                response_data['message'] = 'Use SELL webhook to exit existing positions first'
+            else:
+                response_data['message'] = 'Use BUY webhook to enter positions first'
+            
+            return jsonify(response_data), 400
         
         # Get API key from database
         api_key = get_api_key_for_tradingview(strategy.user_id)
@@ -759,13 +805,13 @@ def webhook(webhook_id):
         processed_orders = []
         failed_orders = []
         
-        # Sort mappings to process BUY orders first, then SELL orders
+        # Sort mappings to process orders based on webhook action
         def get_order_priority(mapping):
-            if webhook_action == 'BUY':
-                # For BUY webhook, prioritize BUY orders (positive quantities)
+            if webhook_action == 'ENTRY':
+                # For ENTRY webhook, prioritize BUY orders first, then SELL orders
                 return 0 if mapping.quantity > 0 else 1
-            else:  # webhook_action == 'SELL'
-                # For SELL webhook, prioritize SELL orders (negative quantities)
+            else:  # webhook_action == 'EXIT'
+                # For EXIT webhook (reverse), prioritize SELL orders first, then BUY orders
                 return 0 if mapping.quantity < 0 else 1
         
         sorted_mappings = sorted(mappings, key=get_order_priority)
@@ -773,12 +819,12 @@ def webhook(webhook_id):
         for mapping in sorted_mappings:
             try:
                 # Determine the action based on quantity sign and webhook action
-                if webhook_action == 'BUY':
-                    # For BUY webhook, use the mapping quantity as-is
+                if webhook_action == 'ENTRY':
+                    # For ENTRY webhook, use the mapping quantity as-is
                     order_action = 'BUY' if mapping.quantity > 0 else 'SELL'
                     order_quantity = abs(mapping.quantity)
-                else:  # webhook_action == 'SELL'
-                    # For SELL webhook, reverse the quantity sign for exit
+                else:  # webhook_action == 'EXIT'
+                    # For EXIT webhook (reverse), reverse the quantity sign for closing positions
                     order_action = 'SELL' if mapping.quantity > 0 else 'BUY'
                     order_quantity = abs(mapping.quantity)
                 
@@ -803,17 +849,32 @@ def webhook(webhook_id):
                 })
                 logger.info(f'Strategy order queued: {order_action} {mapping.symbol} qty={order_quantity}')
                 
-                # Create strategy position record for tracking PnL
-                # Note: This is a simplified approach - in production, you'd want to get actual fill prices
-                # For now, we'll use a placeholder price that should be updated from order fills
-                placeholder_price = 100.0  # This should be replaced with actual fill price
-                create_strategy_position(
-                    strategy_id=strategy.id,
-                    symbol=mapping.symbol,
-                    exchange=mapping.exchange,
-                    quantity=order_quantity,
-                    average_price=placeholder_price
-                )
+                # Enhanced position management logic
+                if webhook_action == 'ENTRY':
+                    # For ENTRY webhook, create new position
+                    placeholder_price = 100.0  # This should be replaced with actual fill price
+                    create_strategy_position(
+                        strategy_id=strategy.id,
+                        symbol=mapping.symbol,
+                        exchange=mapping.exchange,
+                        quantity=order_quantity,
+                        average_price=placeholder_price
+                    )
+                    logger.info(f'Created new position for {mapping.symbol} via ENTRY')
+                
+                else:  # webhook_action == 'EXIT'
+                    # For EXIT webhook (reverse), close existing positions
+                    # Get fresh position data for closing
+                    current_positions = get_strategy_positions(strategy.id)
+                    for pos in current_positions:
+                        if (pos.symbol == mapping.symbol and 
+                            pos.exchange == mapping.exchange and 
+                            pos.is_active):
+                            # Close the position
+                            realized_pnl = 0.0  # This should be calculated based on actual exit price
+                            close_strategy_position(pos.id, realized_pnl)
+                            logger.info(f'Closed position for {mapping.symbol} via EXIT')
+                            break
                 
             except Exception as e:
                 failed_orders.append({
@@ -827,7 +888,8 @@ def webhook(webhook_id):
             'message': f'Strategy execution completed for webhook symbol {webhook_symbol}',
             'webhook_action': webhook_action,
             'processed_orders': processed_orders,
-            'total_processed': len(processed_orders)
+            'total_processed': len(processed_orders),
+            'position_action': 'ENTRY' if webhook_action == 'ENTRY' else 'EXIT'
         }
         
         if failed_orders:

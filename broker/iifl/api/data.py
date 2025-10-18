@@ -141,7 +141,7 @@ class BrokerData:
         """
         try:
             payload = {
-                "instruments": [token],
+                "instruments": [token] if isinstance(token, dict) else token,
                 "xtsMessageCode": message_code,
                 "publishFormat": "JSON"
             }
@@ -164,13 +164,14 @@ class BrokerData:
             if not list_quotes:
                 logger.warning(f"Empty listQuotes in response (code {message_code})")
                 return None
+            data = []
+            for quote in list_quotes:
+                if not quote:
+                    logger.warning(f"No data in response (code {message_code})")
+                    continue
+                data.append(json.loads(quote) if isinstance(quote, str) else quote)
                 
-            raw_data = list_quotes[0]
-            if not raw_data:
-                logger.warning(f"No data in response (code {message_code})")
-                return None
-                
-            return json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+            return data if len(data) > 0 else None
             
         except Exception as e:
             logger.error(f"Error in _fetch_market_data (code {message_code}): {str(e)}", exc_info=True)
@@ -187,29 +188,34 @@ class BrokerData:
         """
         try:
             # Get instrument token and exchange segment
-            symbol_info, brexchange = self._get_instrument_token(symbol, exchange)
-            
-            # Prepare token for API requests
-            token = {
-                "exchangeSegment": brexchange,
-                "exchangeInstrumentID": symbol_info.token
-            }
-            
+            symbol_list = symbol.split(",")
+            tokens = []
+            for symbol in symbol_list:
+                symbol_info, brexchange = self._get_instrument_token(symbol, exchange)
+                token = {
+                    "exchangeSegment": brexchange,
+                    "exchangeInstrumentID": int(symbol_info.token)
+                }
+                tokens.append(token.copy())
+            print(tokens)
             # Fetch market data (xtsMessageCode 1502)
-            market_data = self._fetch_market_data(token, 1502)
+            market_data = self._fetch_market_data(tokens, 1502)
             if not market_data:
                 raise Exception("Failed to fetch market data")
                 
             # Fetch Open Interest data (xtsMessageCode 1510) - non-blocking
-            oi_data = None
-            try:
-                oi_data = self._fetch_market_data(token, 1510)
-            except Exception as e:
-                logger.warning(f"Failed to fetch OI data: {str(e)}")
+            # oi_data = None
+            # try:
+            #     oi_data = self._fetch_market_data(tokens, 1510)
+            # except Exception as e:
+            #     logger.warning(f"Failed to fetch OI data: {str(e)}")
             
             # Process market data
-            touchline = market_data.get('Touchline', {})
-            quote_data = {
+            quote_data = []
+            for quote in market_data:
+                touchline = quote.get('Touchline', {})
+                quote_data.append({
+                'ExchangeInstrumentID': quote.get('ExchangeInstrumentID', 0),
                 'ask': touchline.get('AskInfo', {}).get('Price', 0),
                 'bid': touchline.get('BidInfo', {}).get('Price', 0),
                 'high': touchline.get('High', 0),
@@ -218,13 +224,14 @@ class BrokerData:
                 'open': touchline.get('Open', 0),
                 'prev_close': touchline.get('Close', 0),
                 'volume': touchline.get('TotalTradedQuantity', 0),
+                'atp': touchline.get('AverageTradedPrice', 0),
                 'oi': 0  # Default value if OI data is not available
-            }
+            })
             
             # Add OI data if available
-            if oi_data and 'OpenInterest' in oi_data:
-                quote_data['oi'] = oi_data['OpenInterest']
-                logger.debug(f"Added OI data: {quote_data['oi']}")
+            # if oi_data and 'OpenInterest' in oi_data:
+            #     quote_data['oi'] = oi_data['OpenInterest']
+            #     logger.debug(f"Added OI data: {quote_data['oi']}")
             
             return quote_data
             
