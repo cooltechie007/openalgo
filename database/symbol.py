@@ -92,7 +92,9 @@ def enhanced_search_symbols(query: str, exchange: str = None) -> List[SymToken]:
                     SymToken.symbol.ilike(f'{term}%'),
                     SymToken.brsymbol.ilike(f'{term}%'),
                     SymToken.name.ilike(f'{term}%'),
-                    SymToken.token.ilike(f'{term}%')
+                    SymToken.token.ilike(f'{term}%'),
+                    SymToken.expiry == term,
+                    SymToken.instrumenttype == term
                 )
             all_conditions.append(term_conditions)
         

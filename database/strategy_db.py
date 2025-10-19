@@ -63,6 +63,8 @@ class StrategySymbolMapping(Base):
     exchange = Column(String(10), nullable=False)
     quantity = Column(Integer, nullable=False)  # Positive for BUY, Negative for SELL
     product_type = Column(String(10), nullable=False)  # MIS/CNC
+    strike_offset = Column(Integer, default=0)  # Strike offset from ATM (e.g., -2, -1, 0, 1, 2)
+    option_type = Column(String(10), default='XX')  # Option type (CE, PE, FUT, XX, etc.)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
@@ -77,11 +79,13 @@ class StrategyPosition(Base):
     strategy_id = Column(Integer, ForeignKey('strategies.id'), nullable=False)
     symbol = Column(String(50), nullable=False)
     exchange = Column(String(10), nullable=False)
-    quantity = Column(Integer, nullable=False)  # Current position quantity
+    quantity = Column(Integer, nullable=False)  # Current position quantity (negative for SELL entries)
     average_price = Column(Float, nullable=False)  # Average entry price
     current_price = Column(Float, default=0.0)  # Current market price
     unrealized_pnl = Column(Float, default=0.0)  # Unrealized PnL
     realized_pnl = Column(Float, default=0.0)  # Realized PnL
+    product_type = Column(String(10), nullable=False, default='MIS')  # MIS/CNC/NRML
+    entry_type = Column(String(10), nullable=False)  # BUY/SELL - original entry action
     entry_time = Column(DateTime(timezone=True), server_default=func.now())
     exit_time = Column(DateTime(timezone=True))
     is_active = Column(Boolean, default=True)  # Whether position is still active
@@ -202,7 +206,7 @@ def update_strategy_times(strategy_id, start_time=None, end_time=None, squareoff
         db_session.rollback()
         return False
 
-def add_symbol_mapping(strategy_id, symbol, exchange, quantity, product_type):
+def add_symbol_mapping(strategy_id, symbol, exchange, quantity, product_type, strike_offset=0, option_type='XX'):
     """Add symbol mapping to strategy"""
     try:
         mapping = StrategySymbolMapping(
@@ -210,7 +214,9 @@ def add_symbol_mapping(strategy_id, symbol, exchange, quantity, product_type):
             symbol=symbol,
             exchange=exchange,
             quantity=quantity,
-            product_type=product_type
+            product_type=product_type,
+            strike_offset=strike_offset,
+            option_type=option_type
         )
         db_session.add(mapping)
         db_session.commit()
@@ -229,7 +235,9 @@ def bulk_add_symbol_mappings(strategy_id, mappings):
                 symbol=mapping_data.get('symbol'),
                 exchange=mapping_data.get('exchange'),
                 quantity=mapping_data.get('quantity'),
-                product_type=mapping_data.get('product_type')
+                product_type=mapping_data.get('product_type'),
+                strike_offset=mapping_data.get('strike_offset', 0),
+                option_type=mapping_data.get('option_type', 'XX')
             )
             db_session.add(mapping)
         db_session.commit()
@@ -277,9 +285,15 @@ def has_active_positions(strategy_id):
         logger.error(f"Error checking active positions: {str(e)}")
         return False
 
-def create_strategy_position(strategy_id, symbol, exchange, quantity, average_price):
+def create_strategy_position(strategy_id, symbol, exchange, quantity, average_price, product_type='MIS', entry_type='BUY'):
     """Create a new strategy position"""
     try:
+        # Ensure quantity is negative for SELL entries
+        if entry_type == 'SELL':
+            quantity = -abs(quantity)
+        else:
+            quantity = abs(quantity)
+            
         position = StrategyPosition(
             strategy_id=strategy_id,
             symbol=symbol,
@@ -288,7 +302,9 @@ def create_strategy_position(strategy_id, symbol, exchange, quantity, average_pr
             average_price=average_price,
             current_price=average_price,
             unrealized_pnl=0.0,
-            realized_pnl=0.0
+            realized_pnl=0.0,
+            product_type=product_type,
+            entry_type=entry_type
         )
         db_session.add(position)
         db_session.commit()

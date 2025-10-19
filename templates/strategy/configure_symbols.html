@@ -92,6 +92,36 @@
                         </select>
                     </div>
 
+                    <div class="form-control w-full">
+                        <label class="label">
+                            <span class="label-text">Strike Offset</span>
+                            <span class="label-text-alt text-info">Optional</span>
+                        </label>
+                        <input type="number" name="strike_offset" class="input input-bordered w-full"
+                               step="1" value="0" placeholder="0">
+                        <label class="label">
+                            <span class="label-text-alt">Offset from ATM strike (e.g., -2, -1, 0, 1, 2)</span>
+                        </label>
+                    </div>
+
+                    <div class="form-control w-full">
+                        <label class="label">
+                            <span class="label-text">Option Type</span>
+                            <span class="label-text-alt text-info">Optional</span>
+                        </label>
+                        <select name="option_type" class="select select-bordered w-full">
+                            <option value="XX" selected>XX (Default)</option>
+                            <option value="CE">CE (Call European)</option>
+                            <option value="PE">PE (Put European)</option>
+                            <option value="FUT">FUT (Future)</option>
+                            <option value="INDEX">INDEX</option>
+                            <option value="EQ">EQ (Equity)</option>
+                        </select>
+                        <label class="label">
+                            <span class="label-text-alt">Instrument type (XX = any/auto)</span>
+                        </label>
+                    </div>
+
                     <div class="card-actions justify-end">
                         <button type="submit" class="btn btn-primary">Add Symbol</button>
                     </div>
@@ -111,20 +141,22 @@
                             <span class="label-text-alt text-error">*</span>
                         </label>
                         <textarea name="symbols" class="textarea textarea-bordered w-full h-48" required
-                                  placeholder="Format: Symbol,Exchange,Quantity,Product&#10;Example:&#10;SBIN,NSE,100,MIS&#10;INFY,NSE,-50,CNC&#10;Note: Positive quantity = BUY, Negative quantity = SELL"></textarea>
+                                  placeholder="Format: Symbol,Exchange,Quantity,Product,StrikeOffset,OptionType&#10;Example:&#10;SBIN,NSE,100,MIS,0,XX&#10;INFY,NSE,-50,CNC,-1,EQ&#10;NIFTY,NFO,25,MIS,0,CE&#10;Note: Positive quantity = BUY, Negative quantity = SELL&#10;Strike offset: -2,-1,0,1,2 (0 = ATM)&#10;Option type: XX,CE,PE,FUT,INDEX,EQ (XX = default)"></textarea>
                     </div>
 
                     <div class="alert alert-info">
                         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                         <div>
                             <h3 class="font-bold">CSV Format</h3>
-                            <p class="text-sm">Each line should contain: Symbol,Exchange,Quantity,Product</p>
+                            <p class="text-sm">Each line should contain: Symbol,Exchange,Quantity,Product,StrikeOffset,OptionType</p>
                             <ul class="list-disc list-inside text-sm mt-2">
                                 <li>Exchange: NSE, BSE, NFO, CDS, BFO, BCD, MCX, or NCDEX</li>
                                 <li>Product: MIS (Intraday), CNC (Delivery), or NRML (Normal)</li>
                                 <li>Note: CNC is only available for NSE/BSE, NRML for derivatives</li>
                                 <li>Quantity: Positive for BUY orders, Negative for SELL orders</li>
                                 <li>Examples: +100 (BUY 100), -50 (SELL 50)</li>
+                                <li>Strike Offset: -2,-1,0,1,2 (0 = ATM, negative = ITM, positive = OTM)</li>
+                                <li>Option Type: XX,CE,PE,FUT,INDEX,EQ (XX = default/any)</li>
                             </ul>
                         </div>
                     </div>
@@ -151,6 +183,8 @@
                             <th>Exchange</th>
                             <th>Quantity</th>
                             <th>Product</th>
+                            <th>Strike Offset</th>
+                            <th>Option Type</th>
                             <th>Actions</th>
                         </tr>
                     </thead>
@@ -161,6 +195,22 @@
                             <td><div class="badge badge-ghost">{{ mapping.exchange }}</div></td>
                             <td>{{ mapping.quantity }}</td>
                             <td>{{ mapping.product_type }}</td>
+                            <td>
+                                {% if mapping.strike_offset %}
+                                    <div class="badge {% if mapping.strike_offset < 0 %}badge-error{% elif mapping.strike_offset > 0 %}badge-success{% else %}badge-info{% endif %}">
+                                        {{ mapping.strike_offset }}
+                                    </div>
+                                {% else %}
+                                    <span class="text-base-content/50">0</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if mapping.option_type and mapping.option_type != 'XX' %}
+                                    <div class="badge badge-outline">{{ mapping.option_type }}</div>
+                                {% else %}
+                                    <span class="text-base-content/50">XX</span>
+                                {% endif %}
+                            </td>
                             <td>
                                 <button class="btn btn-error btn-xs delete-symbol">
                                     Delete
@@ -283,6 +333,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const exchange = formData.get('exchange');
         const quantity = formData.get('quantity');
         const product_type = formData.get('product_type');
+        const strike_offset = formData.get('strike_offset') || 0;
+        const option_type = formData.get('option_type') || 'XX';
         
         if (!symbol || !exchange || !quantity || !product_type) {
             return;
@@ -296,7 +348,9 @@ document.addEventListener('DOMContentLoaded', function() {
             symbol: symbol,
             exchange: exchange,
             quantity: quantity,
-            product_type: product_type
+            product_type: product_type,
+            strike_offset: parseInt(strike_offset),
+            option_type: option_type
         };
         
         fetch(`{{ url_for('strategy_bp.configure_symbols', strategy_id=strategy.id) }}`, {

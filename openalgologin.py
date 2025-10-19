@@ -3,7 +3,7 @@ from playwright.sync_api import Playwright, sync_playwright, expect
 import time
 
 def run(playwright: Playwright) -> None:
-    browser = playwright.chromium.launch(headless=True)
+    browser = playwright.chromium.launch(headless=False)
     context = browser.new_context()
     page = context.new_page()
     page.goto("http://127.0.0.1:5000/auth/login")
@@ -14,7 +14,8 @@ def run(playwright: Playwright) -> None:
     page.get_by_role("textbox", name="Enter your username").press("Tab")
     page.get_by_role("textbox", name="Enter your password").fill("Demoacc@1")
     page.get_by_role("button", name="Sign in").click()
-    time.sleep(5)
+    page.wait_for_url("http://127.0.0.1:5000/auth/broker",timeout=10000)
+    time.sleep(2)
     page.get_by_role("button", name="Connect Account").click()
     time.sleep(5)
     page.close()

@@ -539,17 +539,18 @@ def configure_symbols(strategy_id):
                         continue
                     
                     parts = line.strip().split(',')
-                    if len(parts) != 4:
-                        raise ValueError(f'Invalid format in line: {line}. Expected: symbol,exchange,quantity,product')
+                    if len(parts) != 6:
+                        raise ValueError(f'Invalid format in line: {line}. Expected: symbol,exchange,quantity,product,strike_offset,option_type')
                     
-                    symbol, exchange, quantity, product = parts
+                    symbol, exchange, quantity, product, strike_offset, option_type = parts
                     if exchange not in VALID_EXCHANGES:
                         raise ValueError(f'Invalid exchange: {exchange}')
                     
                     try:
                         quantity = int(quantity)
+                        strike_offset = int(strike_offset)
                     except ValueError:
-                        raise ValueError(f'Invalid quantity: {quantity}. Must be a number')
+                        raise ValueError(f'Invalid quantity or strike_offset: {quantity}, {strike_offset}. Must be numbers')
                     
                     if quantity == 0:
                         raise ValueError(f'Quantity cannot be zero for symbol: {symbol}')
@@ -558,7 +559,9 @@ def configure_symbols(strategy_id):
                         'symbol': symbol.strip(),
                         'exchange': exchange.strip(),
                         'quantity': quantity,
-                        'product_type': product.strip()
+                        'product_type': product.strip(),
+                        'strike_offset': strike_offset,
+                        'option_type': option_type.strip()
                     })
                 
                 if mappings:
@@ -571,8 +574,10 @@ def configure_symbols(strategy_id):
                 exchange = data.get('exchange')
                 quantity = data.get('quantity')
                 product_type = data.get('product_type')
+                strike_offset = data.get('strike_offset', 0)  # Default to 0 (ATM)
+                option_type = data.get('option_type', 'XX')  # Default to XX
                 
-                logger.info(f"Processing single symbol: symbol={symbol}, exchange={exchange}, quantity={quantity}, product_type={product_type}")
+                logger.info(f"Processing single symbol: symbol={symbol}, exchange={exchange}, quantity={quantity}, product_type={product_type}, strike_offset={strike_offset}, option_type={option_type}")
                 
                 if not all([symbol, exchange, quantity, product_type]):
                     missing = []
@@ -587,8 +592,9 @@ def configure_symbols(strategy_id):
                 
                 try:
                     quantity = int(quantity)
+                    strike_offset = int(strike_offset)
                 except ValueError:
-                    raise ValueError('Quantity must be a valid number')
+                    raise ValueError('Quantity and strike_offset must be valid numbers')
                 
                 if quantity == 0:
                     raise ValueError('Quantity cannot be zero')
@@ -598,7 +604,9 @@ def configure_symbols(strategy_id):
                     symbol=symbol,
                     exchange=exchange,
                     quantity=quantity,
-                    product_type=product_type
+                    product_type=product_type,
+                    strike_offset=strike_offset,
+                    option_type=option_type
                 )
                 
                 if mapping:
@@ -695,44 +703,141 @@ def get_strategy_pnl_api(strategy_id):
         logger.error(f'Error getting strategy PnL: {str(e)}')
         return jsonify({'error': 'Internal server error'}), 500
 
+def resolve_symbols_from_configuration(strategy_id, base_symbol, expiry, current_price, spread_config=None):
+    """
+    Resolve actual trading symbols based on strategy configuration, expiry, and current price
+    Uses symbol search instead of hardcoding symbol construction
+    
+    Args:
+        strategy_id: Strategy ID
+        base_symbol: Base symbol (e.g., 'NIFTY', 'BANKNIFTY')
+        expiry: Expiry date (e.g., '04NOV25')
+        current_price: Current LTP of the base symbol
+        spread_config: Optional spread configuration for multi-leg strategies
+    
+    Returns:
+        list: List of resolved symbol mappings with actual trading symbols
+    """
+    try:
+        # Get strategy symbol mappings
+        mappings = get_symbol_mappings(strategy_id)
+        if not mappings:
+            logger.error(f"No symbol mappings found for strategy {strategy_id}")
+            return []
+        
+        resolved_mappings = []
+        
+        for mapping in mappings:
+            try:
+                # Calculate ATM strike based on current price
+                atm_strike = round(current_price / spread_config) * spread_config  # Round to nearest 50
+                
+                sign = 1 if mapping.option_type == 'CE' else -1
+                # Calculate actual strike based on offset
+                actual_strike = int(atm_strike + (mapping.strike_offset * spread_config * sign))
+                
+                option_type = mapping.option_type
+                
+                resolved_symbols = []
+                
+                search_query = f"{base_symbol} {int(actual_strike)} {option_type} {expiry}"
+                
+                # Use enhanced symbol search
+                search_results = enhanced_search_symbols(search_query, mapping.exchange)
+                
+                # Filter results to find exact matches
+                for result in search_results:
+                    # Check if this result matches our criteria
+                    if (result.name == base_symbol and 
+                        result.expiry == expiry and 
+                        result.strike == actual_strike and 
+                        result.instrumenttype == option_type and 
+                        result.exchange == mapping.exchange):
+                        
+                        resolved_symbols.append({
+                            'symbol': result.symbol,
+                            'exchange': mapping.exchange,
+                            'quantity': mapping.quantity,
+                            'product_type': mapping.product_type,
+                            'strike_offset': mapping.strike_offset,
+                            'option_type': option_type,
+                            'actual_strike': actual_strike,
+                            'atm_strike': atm_strike,
+                            'current_price': current_price,
+                            'token': result.token,
+                            'lotsize': result.lotsize
+                        })
+                        logger.info(f"Found symbol via search: {result.symbol} (strike: {actual_strike}, type: {option_type})")
+                        break  # Found exact match, no need to continue
+                   
+                resolved_mappings.extend(resolved_symbols)
+                
+            except Exception as e:
+                logger.error(f"Error resolving symbol for mapping {mapping.id}: {str(e)}")
+                continue
+        
+        logger.info(f"Resolved {len(resolved_mappings)} symbols for strategy {strategy_id} using symbol search")
+        return resolved_mappings
+        
+    except Exception as e:
+        logger.error(f"Error in resolve_symbols_from_configuration: {str(e)}")
+        return []
+
+
 @strategy_bp.route('/webhook/<webhook_id>', methods=['POST'])
 @limiter.limit(WEBHOOK_RATE_LIMIT)
 def webhook(webhook_id):
     """
-    Handle webhook from trading platform with enhanced position logic
+    Handle webhook from trading platform with enhanced position logic and dynamic symbol resolution
+    
+    SUPPORTED FORMATS:
+    
+    1. ENHANCED WEBHOOK (Recommended):
+    {
+        "symbol": "NIFTY",           // Base symbol
+        "expiry": "04NOV25",         // Expiry date
+        "price": 25000,              // Current LTP for ATM calculation
+        "action": "ENTRY",           // ENTRY or EXIT
+        "spread": {...}              // Optional spread configuration
+    }
+    
+    2. LEGACY WEBHOOK:
+    {
+        "symbol": "NIFTY04NOV2525000CE",
+        "action": "ENTRY"
+    }
     
     ENHANCED POSITION LOGIC:
     - ENTRY webhook: Entry orders (as configured in strategy) - only allowed if NO active positions exist
-    - EXIT webhook: Reverse orders (closes positions) - only allowed if active positions exist
+    - EXIT webhook: Closes actual positions from database - only allowed if active positions exist
     
-    When a webhook is called with a symbol, it executes ALL orders configured in the strategy.
-    Each symbol mapping uses quantity sign: positive for BUY, negative for SELL.
+    DYNAMIC SYMBOL RESOLUTION (ENTRY only):
+    - Uses symbol search to find actual trading symbols based on configuration
+    - Calculates ATM strike from current price
+    - Applies strike_offset from strategy configuration with CE/PE sign logic
+    - Supports option_type filtering (CE, PE, FUT, XX, etc.)
+    - Falls back to closest available strikes if exact match not found
     
-    Order Execution Priority:
-    - ENTRY webhook: Executes orders as configured (entry)
-    - EXIT webhook: Reverses all orders (exit by doing opposite)
+    EXIT WEBHOOK BEHAVIOR:
+    - Gets all active positions from database via validate_position_logic
+    - Uses stored product_type and entry_type from position records
+    - Converts positions to exit orders (reverses position quantity)
+    - Position quantities: positive for BUY entries, negative for SELL entries
+    - Closes specific positions by position_id
+    - No symbol resolution needed - uses actual position symbols
     
-    Example webhook payloads:
-    {
-        "symbol": "NIFTY04NOV2525000CE",
-        "action": "ENTRY"   // Entry - executes as configured
-    }
-    {
-        "symbol": "NIFTY04NOV2525000CE",
-        "action": "EXIT"    // Exit - reverses all orders
-    }
+    Strategy configuration example:
+    - Symbol: NIFTY, Exchange: NFO, Quantity: +50, Strike Offset: 0, Option Type: CE
+    - Symbol: NIFTY, Exchange: NFO, Quantity: -50, Strike Offset: +2, Option Type: PE
     
-    Strategy configuration:
-    - NIFTY04NOV2525000CE: quantity = +50 (BUY)
-    - NIFTY04NOV2525200CE: quantity = -50 (SELL)
+    Execution for ENHANCED ENTRY webhook (NIFTY at 25000):
+    1. BUY NIFTY04NOV2525000CE (50 qty) - ATM strike
+    2. SELL NIFTY04NOV2525100PE (50 qty) - +2 offset strike
     
-    Execution for ENTRY webhook:
-    1. BUY NIFTY04NOV2525000CE (50 qty) - executed first
-    2. SELL NIFTY04NOV2525200CE (50 qty) - executed second
-    
-    Execution for EXIT webhook (reverse):
-    1. SELL NIFTY04NOV2525000CE (50 qty) - reverse of BUY
-    2. BUY NIFTY04NOV2525200CE (50 qty) - reverse of SELL
+    Execution for EXIT webhook (closes actual positions):
+    1. Gets active positions from database
+    2. SELL NIFTY04NOV2525000CE (50 qty) - closes long position (quantity: +50)
+    3. BUY NIFTY04NOV2525100PE (25 qty) - closes short position (quantity: -25)
     """
     try:
         strategy = get_strategy_by_webhook_id(webhook_id)
@@ -747,18 +852,56 @@ def webhook(webhook_id):
         if not data:
             return jsonify({'error': 'No data received'}), 400
         
-        # Validate required fields
+        # Validate required fields - support both old and new format
+        webhook_action = data.get('action', '').upper()
         required_fields = ['symbol', 'action']
         missing_fields = [field for field in required_fields if field not in data]
         if missing_fields:
             return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
         
         webhook_symbol = data['symbol']
-        webhook_action = data['action'].upper()
         
+        # Get all symbol mappings for this strategy (legacy behavior)
+        mappings = get_symbol_mappings(strategy.id)
+        if not mappings:
+            return jsonify({'error': 'No symbol mappings found for this strategy'}), 400
+    
         # Validate action
         if webhook_action not in ['ENTRY', 'EXIT']:
             return jsonify({'error': 'Invalid action. Use ENTRY or EXIT'}), 400
+        # Check if this is enhanced webhook with expiry, price, spread
+        if 'expiry' in data and 'price' in data and 'spread' in data and webhook_action == 'ENTRY':
+            # Enhanced webhook format
+            base_symbol = data.get('symbol', '')
+            expiry = data.get('expiry', '')
+            current_price = float(data.get('price', 0))
+            spread_config = int(data.get('spread', 0))
+            
+            if not all([base_symbol, expiry, current_price, webhook_action]):
+                missing_fields = []
+                if not base_symbol: missing_fields.append('symbol')
+                if not expiry: missing_fields.append('expiry')
+                if not current_price: missing_fields.append('price')
+                if not webhook_action: missing_fields.append('action')
+                return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+            
+            logger.info(f"Enhanced webhook: base_symbol={base_symbol}, expiry={expiry}, price={current_price}, action={webhook_action}")
+            
+            # Resolve symbols dynamically based on configuration using symbol search
+            resolved_mappings = resolve_symbols_from_configuration(
+                strategy_id=strategy.id,
+                base_symbol=base_symbol,
+                expiry=expiry,
+                current_price=current_price,
+                spread_config=spread_config
+            )
+            
+            if not resolved_mappings:
+                return jsonify({'error': 'No symbols could be resolved from configuration using symbol search'}), 400
+            
+            # Use resolved mappings instead of static mappings
+            mappings = resolved_mappings
+            webhook_symbol = f"{base_symbol}{expiry}"
         
         # Check trading hours for intraday strategies
         if strategy.is_intraday:
@@ -775,11 +918,6 @@ def webhook(webhook_id):
             if strategy.squareoff_time and current_time > strategy.squareoff_time:
                 return jsonify({'error': 'Orders not allowed after square off time'}), 400
         
-        # Get all symbol mappings for this strategy
-        mappings = get_symbol_mappings(strategy.id)
-        if not mappings:
-            return jsonify({'error': 'No symbol mappings found for this strategy'}), 400
-        
         # Enhanced position logic validation
         is_valid, error_message, active_positions_info = validate_position_logic(strategy.id, webhook_action)
         if not is_valid:
@@ -789,11 +927,35 @@ def webhook(webhook_id):
             }
             if active_positions_info:
                 response_data['active_positions'] = active_positions_info
-                response_data['message'] = 'Use SELL webhook to exit existing positions first'
+                response_data['message'] = 'Use EXIT webhook to exit existing positions first'
             else:
-                response_data['message'] = 'Use BUY webhook to enter positions first'
+                response_data['message'] = 'Use ENTRY webhook to enter positions first'
             
             return jsonify(response_data), 400
+        
+        # For EXIT actions, get actual positions from database instead of using mappings
+        if webhook_action == 'EXIT':
+            # Get actual positions from database
+            current_positions = get_strategy_positions(strategy.id)
+            active_positions = [pos for pos in current_positions if pos.is_active]
+            
+            if not active_positions:
+                return jsonify({'error': 'No active positions found to exit'}), 400
+            
+            # Convert positions to mapping-like structure for processing
+            mappings = []
+            for pos in active_positions:
+                mappings.append({
+                    'symbol': pos.symbol,
+                    'exchange': pos.exchange,
+                    'quantity': pos.quantity,  # Use actual position quantity
+                    'product_type': pos.product_type,  # Use stored product type
+                    'position_id': pos.id,
+                    'average_price': pos.average_price,
+                    'entry_type': pos.entry_type
+                })
+            
+            logger.info(f"EXIT webhook: Found {len(mappings)} active positions to close")
         
         # Get API key from database
         api_key = get_api_key_for_tradingview(strategy.user_id)
@@ -807,81 +969,111 @@ def webhook(webhook_id):
         
         # Sort mappings to process orders based on webhook action
         def get_order_priority(mapping):
+            # Handle both legacy mappings (objects) and resolved mappings (dicts)
+            quantity = mapping.quantity if hasattr(mapping, 'quantity') else mapping['quantity']
             if webhook_action == 'ENTRY':
                 # For ENTRY webhook, prioritize BUY orders first, then SELL orders
-                return 0 if mapping.quantity > 0 else 1
+                return 0 if quantity > 0 else 1
             else:  # webhook_action == 'EXIT'
                 # For EXIT webhook (reverse), prioritize SELL orders first, then BUY orders
-                return 0 if mapping.quantity < 0 else 1
+                return 0 if quantity < 0 else 1
         
         sorted_mappings = sorted(mappings, key=get_order_priority)
         
         for mapping in sorted_mappings:
             try:
+                # Handle both legacy mappings (objects) and resolved mappings (dicts)
+                if isinstance(mapping, dict):
+                    # Resolved mapping (dictionary)
+                    symbol = mapping['symbol']
+                    exchange = mapping['exchange']
+                    quantity = mapping['quantity']
+                    product_type = mapping['product_type']
+                    mapping_id = f"resolved_{mapping.get('actual_strike', 'unknown')}"
+                else:
+                    # Legacy mapping (object)
+                    symbol = mapping.symbol
+                    exchange = mapping.exchange
+                    quantity = mapping.quantity
+                    product_type = mapping.product_type
+                    mapping_id = mapping.id
+                
                 # Determine the action based on quantity sign and webhook action
                 if webhook_action == 'ENTRY':
                     # For ENTRY webhook, use the mapping quantity as-is
-                    order_action = 'BUY' if mapping.quantity > 0 else 'SELL'
-                    order_quantity = abs(mapping.quantity)
+                    order_action = 'BUY' if quantity > 0 else 'SELL'
+                    order_quantity = abs(quantity)
                 else:  # webhook_action == 'EXIT'
-                    # For EXIT webhook (reverse), reverse the quantity sign for closing positions
-                    order_action = 'SELL' if mapping.quantity > 0 else 'BUY'
-                    order_quantity = abs(mapping.quantity)
-                
+                    # For EXIT webhook, reverse the position quantity to close it
+                    # Position quantity already has correct sign (negative for SELL entries)
+                    # To close: if position is long (positive), we SELL; if short (negative), we BUY
+                    order_action = 'SELL' if quantity > 0 else 'BUY'
+                    order_quantity = abs(quantity)  # Use absolute quantity for closing
+                search_results = enhanced_search_symbols(symbol, exchange)
+                if search_results and len(search_results) == 1:
                 # Prepare order payload (only action field)
-                payload = {
-                        'apikey': api_key,
-                        'symbol': mapping.symbol,
-                        'exchange': mapping.exchange,
-                        'product': mapping.product_type,
-                        'strategy': strategy.name,
+                    payload = {
+                            'apikey': api_key,
+                            'symbol': symbol,
+                            'exchange': exchange,
+                            'product': product_type,
+                            'strategy': strategy.name,
+                            'action': order_action,
+                            'quantity': order_quantity,
+                            'pricetype': 'MARKET'
+                        }
+                    
+                    # Queue the order
+                    queue_order('placeorder', payload)
+                    processed_orders.append({
+                        'symbol': symbol,
                         'action': order_action,
                         'quantity': order_quantity,
-                        'pricetype': 'MARKET'
-                    }
+                        'mapping_id': mapping_id
+                    })
+                    logger.info(f'Strategy order queued: {order_action} {symbol} qty={order_quantity}')
                 
-                # Queue the order
-                queue_order('placeorder', payload)
-                processed_orders.append({
-                    'symbol': mapping.symbol,
-                    'action': order_action,
-                    'quantity': order_quantity
-                })
-                logger.info(f'Strategy order queued: {order_action} {mapping.symbol} qty={order_quantity}')
-                
-                # Enhanced position management logic
-                if webhook_action == 'ENTRY':
-                    # For ENTRY webhook, create new position
-                    placeholder_price = 100.0  # This should be replaced with actual fill price
-                    create_strategy_position(
-                        strategy_id=strategy.id,
-                        symbol=mapping.symbol,
-                        exchange=mapping.exchange,
-                        quantity=order_quantity,
-                        average_price=placeholder_price
-                    )
-                    logger.info(f'Created new position for {mapping.symbol} via ENTRY')
-                
-                else:  # webhook_action == 'EXIT'
-                    # For EXIT webhook (reverse), close existing positions
-                    # Get fresh position data for closing
-                    current_positions = get_strategy_positions(strategy.id)
-                    for pos in current_positions:
-                        if (pos.symbol == mapping.symbol and 
-                            pos.exchange == mapping.exchange and 
-                            pos.is_active):
-                            # Close the position
+                    # Enhanced position management logic
+                    if webhook_action == 'ENTRY':
+                        # For ENTRY webhook, create new position
+                        placeholder_price = 100.0  # This should be replaced with actual fill price
+                        create_strategy_position(
+                            strategy_id=strategy.id,
+                            symbol=symbol,
+                            exchange=exchange,
+                            quantity=order_quantity,
+                            average_price=placeholder_price,
+                            product_type=product_type,
+                            entry_type=order_action
+                        )
+                        logger.info(f'Created new position for {symbol} via ENTRY ({order_action})')
+                    
+                    else:  # webhook_action == 'EXIT'
+                        # For EXIT webhook, close the specific position
+                        if isinstance(mapping, dict) and 'position_id' in mapping:
+                            # Close the specific position from database
+                            position_id = mapping['position_id']
                             realized_pnl = 0.0  # This should be calculated based on actual exit price
-                            close_strategy_position(pos.id, realized_pnl)
-                            logger.info(f'Closed position for {mapping.symbol} via EXIT')
-                            break
+                            close_strategy_position(position_id, realized_pnl)
+                            logger.info(f'Closed position {position_id} for {symbol} via EXIT')
+                        else:
+                            # Fallback: find and close position by symbol/exchange
+                            current_positions = get_strategy_positions(strategy.id)
+                            for pos in current_positions:
+                                if (pos.symbol == symbol and 
+                                    pos.exchange == exchange and 
+                                    pos.is_active):
+                                    realized_pnl = 0.0  # This should be calculated based on actual exit price
+                                    close_strategy_position(pos.id, realized_pnl)
+                                    logger.info(f'Closed position for {symbol} via EXIT')
+                                    break
                 
             except Exception as e:
                 failed_orders.append({
-                    'symbol': mapping.symbol,
+                    'symbol': symbol if 'symbol' in locals() else 'unknown',
                     'error': str(e)
                 })
-                logger.error(f'Error processing order for {mapping.symbol}: {str(e)}')
+                logger.error(f'Error processing order for {symbol if "symbol" in locals() else "unknown"}: {str(e)}')
         
         # Return response with processing results
         response_data = {
@@ -897,7 +1089,7 @@ def webhook(webhook_id):
             response_data['total_failed'] = len(failed_orders)
         
         return jsonify(response_data), 200
-            
+
     except Exception as e:
         logger.error(f'Error processing webhook: {str(e)}')
         return jsonify({'error': 'Internal server error'}), 500
